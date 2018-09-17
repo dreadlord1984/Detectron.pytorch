@@ -45,16 +45,16 @@ class keypoint_outputs(nn.Module):
 
     def _init_weights(self):
         if cfg.KRCNN.USE_DECONV:
-            init.normal(self.deconv.weight, std=0.01)
-            init.constant(self.deconv.bias, 0)
+            init.normal_(self.deconv.weight, std=0.01)
+            init.constant_(self.deconv.bias, 0)
 
         if cfg.KRCNN.CONV_INIT == 'GaussianFill':
-            init.normal(self.classify.weight, std=0.001)
+            init.normal_(self.classify.weight, std=0.001)
         elif cfg.KRCNN.CONV_INIT == 'MSRAFill':
-            init.kaiming_normal(self.classify.weight)
+            mynn.init.MSRAFill(self.classify.weight)
         else:
             raise ValueError(cfg.KRCNN.CONV_INIT)
-        init.constant(self.classify.bias, 0)
+        init.constant_(self.classify.bias, 0)
 
     def detectron_weight_mapping(self):
         detectron_weight_mapping = {}
@@ -93,16 +93,17 @@ def keypoint_losses(kps_pred, keypoint_locations_int32, keypoint_weights,
     """Mask R-CNN keypoint specific losses."""
     device_id = kps_pred.get_device()
     kps_target = Variable(torch.from_numpy(
-        keypoint_locations_int32.astype('int64').squeeze())).cuda(device_id)
-    keypoint_weights = Variable(torch.from_numpy(keypoint_weights.squeeze())).cuda(device_id)
+        keypoint_locations_int32.astype('int64'))).cuda(device_id)
+    keypoint_weights = Variable(torch.from_numpy(keypoint_weights)).cuda(device_id)
     # Softmax across **space** (woahh....space!)
     # Note: this is not what is commonly called "spatial softmax"
     # (i.e., softmax applied along the channel dimension at each spatial
     # location); This is softmax applied over a set of spatial locations (i.e.,
     # each spatial location is a "class").
-    losses = F.cross_entropy(
+    loss = F.cross_entropy(
         kps_pred.view(-1, cfg.KRCNN.HEATMAP_SIZE**2), kps_target, reduce=False)
-    loss = cfg.KRCNN.LOSS_WEIGHT * torch.sum(losses * keypoint_weights) / torch.sum(keypoint_weights)
+    loss = torch.sum(loss * keypoint_weights) / torch.sum(keypoint_weights)
+    loss *= cfg.KRCNN.LOSS_WEIGHT
 
     if not cfg.KRCNN.NORMALIZE_BY_VISIBLE_KEYPOINTS:
         # Discussion: the softmax loss above will average the loss by the sum of
@@ -149,12 +150,12 @@ class roi_pose_head_v1convX(nn.Module):
     def _init_weights(self, m):
         if isinstance(m, nn.Conv2d):
             if cfg.KRCNN.CONV_INIT == 'GaussianFill':
-                init.normal(m.weight, std=0.01)
+                init.normal_(m.weight, std=0.01)
             elif cfg.KRCNN.CONV_INIT == 'MSRAFill':
-                init.kaiming_normal(m.weight)
+                mynn.init.MSRAFill(m.weight)
             else:
                 ValueError('Unexpected cfg.KRCNN.CONV_INIT: {}'.format(cfg.KRCNN.CONV_INIT))
-            init.constant(m.bias, 0)
+            init.constant_(m.bias, 0)
 
     def detectron_weight_mapping(self):
         detectron_weight_mapping = {}

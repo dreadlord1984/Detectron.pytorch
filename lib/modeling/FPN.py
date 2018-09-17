@@ -12,6 +12,7 @@ import modeling.ResNet as ResNet
 from modeling.generate_anchors import generate_anchors
 from modeling.generate_proposals import GenerateProposalsOp
 from modeling.collect_and_distribute_fpn_rpn_proposals import CollectAndDistributeFpnRpnProposalsOp
+import nn as mynn
 
 # Lowest and highest pyramid levels in the backbone network. For FPN, we assume
 # that all networks have 5 spatial reductions, each by a factor of 2. Level 1
@@ -92,6 +93,14 @@ class fpn(nn.Module):
         #
         # For the coarest backbone level: 1x1 conv only seeds recursion
         self.conv_top = nn.Conv2d(fpn_dim_lateral[0], fpn_dim, 1, 1, 0)
+        if cfg.FPN.USE_GN:
+            self.conv_top = nn.Sequential(
+                nn.Conv2d(fpn_dim_lateral[0], fpn_dim, 1, 1, 0, bias=False),
+                nn.GroupNorm(net_utils.get_group_gn(fpn_dim), fpn_dim,
+                             eps=cfg.GROUP_NORM.EPSILON)
+            )
+        else:
+            self.conv_top = nn.Conv2d(fpn_dim_lateral[0], fpn_dim, 1, 1, 0)
         self.topdown_lateral_modules = nn.ModuleList()
         self.posthoc_modules = nn.ModuleList()
 
@@ -103,9 +112,17 @@ class fpn(nn.Module):
 
         # Post-hoc scale-specific 3x3 convs
         for i in range(self.num_backbone_stages):
-            self.posthoc_modules.append(
-                nn.Conv2d(fpn_dim, fpn_dim, 3, 1, 1)
-            )
+            if cfg.FPN.USE_GN:
+                self.posthoc_modules.append(nn.Sequential(
+                    nn.Conv2d(fpn_dim, fpn_dim, 3, 1, 1, bias=False),
+                    nn.GroupNorm(net_utils.get_group_gn(fpn_dim), fpn_dim,
+                                 eps=cfg.GROUP_NORM.EPSILON)
+                ))
+            else:
+                self.posthoc_modules.append(
+                    nn.Conv2d(fpn_dim, fpn_dim, 3, 1, 1)
+                )
+
             self.spatial_scale.append(fpn_level_info.spatial_scales[i])
 
         #
@@ -142,9 +159,15 @@ class fpn(nn.Module):
     def _init_weights(self):
         def init_func(m):
             if isinstance(m, nn.Conv2d):
-                init.xavier_uniform(m.weight)
-                init.constant(m.bias, 0)
-        self.apply(init_func)
+                mynn.init.XavierFill(m.weight)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+
+        for child_m in self.children():
+            if (not isinstance(child_m, nn.ModuleList) or
+                not isinstance(child_m[0], topdown_lateral_module)):
+                # topdown_lateral_module has its own init method
+                child_m.apply(init_func)
 
     def detectron_weight_mapping(self):
         conv_body_mapping, orphan_in_detectron = self.conv_body.detectron_weight_mapping()
@@ -153,23 +176,42 @@ class fpn(nn.Module):
             mapping_to_detectron['conv_body.'+key] = value
 
         d_prefix = 'fpn_inner_' + self.fpn_level_info.blobs[0]
-        mapping_to_detectron['conv_top.weight'] = d_prefix + '_w'
-        mapping_to_detectron['conv_top.bias'] = d_prefix + '_b'
+        if cfg.FPN.USE_GN:
+            mapping_to_detectron['conv_top.0.weight'] = d_prefix + '_w'
+            mapping_to_detectron['conv_top.1.weight'] = d_prefix + '_gn_s'
+            mapping_to_detectron['conv_top.1.bias'] = d_prefix + '_gn_b'
+        else:
+            mapping_to_detectron['conv_top.weight'] = d_prefix + '_w'
+            mapping_to_detectron['conv_top.bias'] = d_prefix + '_b'
         for i in range(self.num_backbone_stages - 1):
             p_prefix = 'topdown_lateral_modules.%d.conv_lateral' % i
             d_prefix = 'fpn_inner_' + self.fpn_level_info.blobs[i+1] + '_lateral'
-            mapping_to_detectron.update({
-                p_prefix + '.weight' : d_prefix + '_w',
-                p_prefix + '.bias': d_prefix + '_b'
-            })
+            if cfg.FPN.USE_GN:
+                mapping_to_detectron.update({
+                    p_prefix + '.0.weight' : d_prefix + '_w',
+                    p_prefix + '.1.weight' : d_prefix + '_gn_s',
+                    p_prefix + '.1.bias': d_prefix + '_gn_b'
+                })
+            else:
+                mapping_to_detectron.update({
+                    p_prefix + '.weight' : d_prefix + '_w',
+                    p_prefix + '.bias': d_prefix + '_b'
+                })
 
         for i in range(self.num_backbone_stages):
             p_prefix = 'posthoc_modules.%d' % i
             d_prefix = 'fpn_' + self.fpn_level_info.blobs[i]
-            mapping_to_detectron.update({
-                p_prefix + '.weight': d_prefix + '_w',
-                p_prefix + '.bias': d_prefix + '_b'
-            })
+            if cfg.FPN.USE_GN:
+                mapping_to_detectron.update({
+                    p_prefix + '.0.weight': d_prefix + '_w',
+                    p_prefix + '.1.weight': d_prefix + '_gn_s',
+                    p_prefix + '.1.bias': d_prefix + '_gn_b'
+                })
+            else:
+                mapping_to_detectron.update({
+                    p_prefix + '.weight': d_prefix + '_w',
+                    p_prefix + '.bias': d_prefix + '_b'
+                })
 
         if hasattr(self, 'extra_pyramid_modules'):
             for i in len(self.extra_pyramid_modules):
@@ -223,14 +265,29 @@ class topdown_lateral_module(nn.Module):
         self.dim_in_top = dim_in_top
         self.dim_in_lateral = dim_in_lateral
         self.dim_out = dim_in_top
-
-        self.conv_lateral = nn.Conv2d(dim_in_lateral, self.dim_out, 1, 1, 0)
+        if cfg.FPN.USE_GN:
+            self.conv_lateral = nn.Sequential(
+                nn.Conv2d(dim_in_lateral, self.dim_out, 1, 1, 0, bias=False),
+                nn.GroupNorm(net_utils.get_group_gn(self.dim_out), self.dim_out,
+                             eps=cfg.GROUP_NORM.EPSILON)
+            )
+        else:
+            self.conv_lateral = nn.Conv2d(dim_in_lateral, self.dim_out, 1, 1, 0)
 
         self._init_weights()
 
     def _init_weights(self):
-        init.xavier_uniform(self.conv_lateral.weight)
-        init.constant(self.conv_lateral.bias, 0)
+        if cfg.FPN.USE_GN:
+            conv = self.conv_lateral[0]
+        else:
+            conv = self.conv_lateral
+
+        if cfg.FPN.ZERO_INIT_LATERAL:
+            init.constant_(conv.weight, 0)
+        else:
+            mynn.init.XavierFill(conv.weight)
+        if conv.bias is not None:
+            init.constant_(conv.bias, 0)
 
     def forward(self, top_blob, lateral_blob):
         # Lateral 1x1 conv
@@ -275,7 +332,9 @@ class fpn_rpn_outputs(nn.Module):
 
         # Create conv ops shared by all FPN levels
         self.FPN_RPN_conv = nn.Conv2d(dim_in, self.dim_out, 3, 1, 1)
-        self.FPN_RPN_cls_score = nn.Conv2d(self.dim_out, num_anchors, 1, 1, 0)
+        dim_score = num_anchors * 2 if cfg.RPN.CLS_ACTIVATION == 'softmax' \
+            else num_anchors
+        self.FPN_RPN_cls_score = nn.Conv2d(self.dim_out, dim_score, 1, 1, 0)
         self.FPN_RPN_bbox_pred = nn.Conv2d(self.dim_out, 4 * num_anchors, 1, 1, 0)
 
         self.GenerateProposals_modules = nn.ModuleList()
@@ -295,12 +354,12 @@ class fpn_rpn_outputs(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        init.normal(self.FPN_RPN_conv.weight, std=0.01)
-        init.constant(self.FPN_RPN_conv.bias, 0)
-        init.normal(self.FPN_RPN_cls_score.weight, std=0.01)
-        init.constant(self.FPN_RPN_cls_score.bias, 0)
-        init.normal(self.FPN_RPN_bbox_pred.weight, std=0.01)
-        init.constant(self.FPN_RPN_bbox_pred.bias, 0)
+        init.normal_(self.FPN_RPN_conv.weight, std=0.01)
+        init.constant_(self.FPN_RPN_conv.bias, 0)
+        init.normal_(self.FPN_RPN_cls_score.weight, std=0.01)
+        init.constant_(self.FPN_RPN_cls_score.bias, 0)
+        init.normal_(self.FPN_RPN_bbox_pred.weight, std=0.01)
+        init.constant_(self.FPN_RPN_bbox_pred.bias, 0)
 
     def detectron_weight_mapping(self):
         k_min = cfg.FPN.RPN_MIN_LEVEL
@@ -337,7 +396,13 @@ class fpn_rpn_outputs(nn.Module):
                 #  OR
                 #  2) training for Faster R-CNN
                 # Otherwise (== training for RPN only), proposals are not needed
-                fpn_rpn_cls_probs = F.sigmoid(fpn_rpn_cls_score)
+                if cfg.RPN.CLS_ACTIVATION == 'softmax':
+                    B, C, H, W = fpn_rpn_cls_score.size()
+                    fpn_rpn_cls_probs = F.softmax(
+                        fpn_rpn_cls_score.view(B, 2, C // 2, H, W), dim=1)
+                    fpn_rpn_cls_probs = fpn_rpn_cls_probs[:, 1].squeeze(dim=1)
+                else:  # sigmoid
+                    fpn_rpn_cls_probs = F.sigmoid(fpn_rpn_cls_score)
 
                 fpn_rpn_rois, fpn_rpn_roi_probs = self.GenerateProposals_modules[lvl - k_min](
                     fpn_rpn_cls_probs, fpn_rpn_bbox_pred, im_info)
@@ -361,7 +426,7 @@ def fpn_rpn_losses(**kwargs):
     for lvl in range(cfg.FPN.RPN_MIN_LEVEL, cfg.FPN.RPN_MAX_LEVEL + 1):
         slvl = str(lvl)
         # Spatially narrow the full-sized RPN label arrays to match the feature map shape
-        h, w = kwargs['rpn_cls_logits_fpn' + slvl].shape[2:]
+        b, c, h, w = kwargs['rpn_cls_logits_fpn' + slvl].shape
         rpn_labels_int32_fpn = kwargs['rpn_labels_int32_wide_fpn' + slvl][:, :, :h, :w]
         h, w = kwargs['rpn_bbox_pred_fpn' + slvl].shape[2:]
         rpn_bbox_targets_fpn = kwargs['rpn_bbox_targets_wide_fpn' + slvl][:, :, :h, :w]
@@ -370,11 +435,19 @@ def fpn_rpn_losses(**kwargs):
         rpn_bbox_outside_weights_fpn = kwargs[
             'rpn_bbox_outside_weights_wide_fpn' + slvl][:, :, :h, :w]
 
-        weight = (rpn_labels_int32_fpn >= 0).float()
-        loss_rpn_cls_fpn = F.binary_cross_entropy_with_logits(
-            kwargs['rpn_cls_logits_fpn' + slvl], rpn_labels_int32_fpn.float(), weight,
-            size_average=False)
-        loss_rpn_cls_fpn /= cfg.TRAIN.RPN_BATCH_SIZE_PER_IM * cfg.TRAIN.IMS_PER_BATCH
+        if cfg.RPN.CLS_ACTIVATION == 'softmax':
+            rpn_cls_logits_fpn = kwargs['rpn_cls_logits_fpn' + slvl].view(
+                b, 2, c // 2, h, w).permute(0, 2, 3, 4, 1).contiguous().view(-1, 2)
+            rpn_labels_int32_fpn = rpn_labels_int32_fpn.contiguous().view(-1).long()
+            # the loss is averaged over non-ignored targets
+            loss_rpn_cls_fpn = F.cross_entropy(
+                rpn_cls_logits_fpn, rpn_labels_int32_fpn, ignore_index=-1)
+        else:  # sigmoid
+            weight = (rpn_labels_int32_fpn >= 0).float()
+            loss_rpn_cls_fpn = F.binary_cross_entropy_with_logits(
+                kwargs['rpn_cls_logits_fpn' + slvl], rpn_labels_int32_fpn.float(), weight,
+                size_average=False)
+            loss_rpn_cls_fpn /= cfg.TRAIN.RPN_BATCH_SIZE_PER_IM * cfg.TRAIN.IMS_PER_BATCH
 
         # Normalization by (1) RPN_BATCH_SIZE_PER_IM and (2) IMS_PER_BATCH is
         # handled by (1) setting bbox outside weights and (2) SmoothL1Loss
@@ -387,7 +460,7 @@ def fpn_rpn_losses(**kwargs):
         losses_cls.append(loss_rpn_cls_fpn)
         losses_bbox.append(loss_rpn_bbox_fpn)
 
-    return torch.cat(losses_cls), torch.cat(losses_bbox)
+    return losses_cls, losses_bbox
 
 
 # ---------------------------------------------------------------------------- #

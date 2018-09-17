@@ -71,11 +71,11 @@ def get_fast_rcnn_blob_names(is_training=True):
         # y2).
         blob_names += ['keypoint_rois']
         # 'keypoint_locations_int32': index of keypoint in
-        # KRCNN.HEATMAP_SIZE**2 sized array. Shape is (#instances). Used in
+        # KRCNN.HEATMAP_SIZE**2 sized array. Shape is (#instances * #keypoints). Used in
         # SoftmaxWithLoss.
         blob_names += ['keypoint_locations_int32']
         # 'keypoint_weights': weight assigned to each target in
-        # 'keypoint_locations_int32'. Shape is (#instances). Used in
+        # 'keypoint_locations_int32'. Shape is (#instances * #keypoints). Used in
         # SoftmaxWithLoss.
         blob_names += ['keypoint_weights']
         # 'keypoint_loss_normalizer': optional normalization factor to use if
@@ -212,6 +212,9 @@ def _compute_targets(ex_rois, gt_rois, labels):
 
     targets = box_utils.bbox_transform_inv(ex_rois, gt_rois,
                                            cfg.MODEL.BBOX_REG_WEIGHTS)
+    # Use class "1" for all fg boxes if using class_agnostic_bbox_reg
+    if cfg.MODEL.CLS_AGNOSTIC_BBOX_REG:
+        labels.clip(max=1, out=labels)
     return np.hstack((labels[:, np.newaxis], targets)).astype(
         np.float32, copy=False)
 

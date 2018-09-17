@@ -29,9 +29,14 @@ from core.test import im_detect_all
 from modeling.model_builder import Generalized_RCNN
 import datasets.dummy_datasets as datasets
 import utils.misc as misc_utils
+import utils.net as net_utils
 import utils.vis as vis_utils
 from utils.detectron_weight_helper import load_detectron_weight
 from utils.timer import Timer
+
+# OpenCL may be enabled by default in OpenCV3; disable it because it's not
+# thread safe and causes unwanted GPU memory allocations.
+cv2.ocl.setUseOpenCL(False)
 
 
 def parse_args():
@@ -102,8 +107,9 @@ def main():
     if args.set_cfgs is not None:
         cfg_from_list(args.set_cfgs)
 
-    assert args.load_ckpt or args.load_detectron
-    cfg.RESNETS.IMAGENET_PRETRAINED = False  # Don't need to load imagenet pretrained weights
+    assert bool(args.load_ckpt) ^ bool(args.load_detectron), \
+        'Exactly one of --load_ckpt and --load_detectron should be specified.'
+    cfg.MODEL.LOAD_IMAGENET_PRETRAINED_WEIGHTS = False  # Don't need to load imagenet pretrained weights
     assert_and_infer_cfg()
 
     maskRCNN = Generalized_RCNN()
@@ -114,15 +120,15 @@ def main():
     if args.load_ckpt:
         load_name = args.load_ckpt
         print("loading checkpoint %s" % (load_name))
-        checkpoint = torch.load(load_name)
-        maskRCNN.load_state_dict(checkpoint['model'], strict=False)
+        checkpoint = torch.load(load_name, map_location=lambda storage, loc: storage)
+        net_utils.load_ckpt(maskRCNN, checkpoint['model'])
 
     if args.load_detectron:
         print("loading detectron weights %s" % args.load_detectron)
         load_detectron_weight(maskRCNN, args.load_detectron)
 
     maskRCNN = mynn.DataParallel(maskRCNN, cpu_keywords=['im_info', 'roidb'],
-                                 minibatch=True)
+                                 minibatch=True, device_ids=[0])  # only support single GPU
 
     maskRCNN.eval()
     if args.image_dir:
@@ -136,6 +142,7 @@ def main():
     for i in xrange(num_images):
         print('img', i)
         im = cv2.imread(imglist[i])
+        assert im is not None
 
         timers = defaultdict(Timer)
 

@@ -1,3 +1,4 @@
+from functools import wraps
 import importlib
 import logging
 
@@ -40,6 +41,31 @@ def get_func(func_name):
     except Exception:
         logger.error('Failed to find function: %s', func_name)
         raise
+
+
+def compare_state_dict(sa, sb):
+    if sa.keys() != sb.keys():
+        return False
+    for k, va in sa.items():
+        if not torch.equal(va, sb[k]):
+            return False
+    return True
+
+
+def check_inference(net_func):
+    @wraps(net_func)
+    def wrapper(self, *args, **kwargs):
+        if not self.training:
+            if cfg.PYTORCH_VERSION_LESS_THAN_040:
+                return net_func(self, *args, **kwargs)
+            else:
+                with torch.no_grad():
+                    return net_func(self, *args, **kwargs)
+        else:
+            raise ValueError('You should call this function only on inference.'
+                              'Set the network in inference mode by net.eval().')
+
+    return wrapper
 
 
 class Generalized_RCNN(nn.Module):
@@ -102,15 +128,22 @@ class Generalized_RCNN(nn.Module):
             resnet_utils.load_pretrained_imagenet_weights(self)
             # Check if shared weights are equaled
             if cfg.MODEL.MASK_ON and getattr(self.Mask_Head, 'SHARE_RES5', False):
-                assert self.Mask_Head.res5.state_dict() == self.Box_Head.res5.state_dict()
+                assert compare_state_dict(self.Mask_Head.res5.state_dict(), self.Box_Head.res5.state_dict())
             if cfg.MODEL.KEYPOINTS_ON and getattr(self.Keypoint_Head, 'SHARE_RES5', False):
-                assert self.Keypoint_Head.res5.state_dict() == self.Box_Head.res5.state_dict()
+                assert compare_state_dict(self.Keypoint_Head.res5.state_dict(), self.Box_Head.res5.state_dict())
 
         if cfg.TRAIN.FREEZE_CONV_BODY:
             for p in self.Conv_Body.parameters():
                 p.requires_grad = False
 
     def forward(self, data, im_info, roidb=None, **rpn_kwargs):
+        if cfg.PYTORCH_VERSION_LESS_THAN_040:
+            return self._forward(data, im_info, roidb, **rpn_kwargs)
+        else:
+            with torch.set_grad_enabled(self.training):
+                return self._forward(data, im_info, roidb, **rpn_kwargs)
+
+    def _forward(self, data, im_info, roidb=None, **rpn_kwargs):
         im_data = data
         if self.training:
             roidb = list(map(lambda x: blob_utils.deserialize(x)[0], roidb))
@@ -123,10 +156,9 @@ class Generalized_RCNN(nn.Module):
 
         rpn_ret = self.RPN(blob_conv, im_info, roidb)
 
-        rois = Variable(torch.from_numpy(rpn_ret['rois'])).cuda(device_id)
-        return_dict['rois'] = rois
-        if self.training:
-            return_dict['rois_label'] = rpn_ret['labels_int32']
+        # if self.training:
+        #     # can be used to infer fg/bg ratio
+        #     return_dict['rois_label'] = rpn_ret['labels_int32']
 
         if cfg.FPN.FPN_ON:
             # Retain only the blobs that will be used for RoI heads. `blob_conv` may include
@@ -142,28 +174,34 @@ class Generalized_RCNN(nn.Module):
             else:
                 box_feat = self.Box_Head(blob_conv, rpn_ret)
             cls_score, bbox_pred = self.Box_Outs(box_feat)
-            return_dict['cls_score'] = cls_score
-            return_dict['bbox_pred'] = bbox_pred
         else:
             # TODO: complete the returns for RPN only situation
             pass
 
         if self.training:
+            return_dict['losses'] = {}
+            return_dict['metrics'] = {}
             # rpn loss
             rpn_kwargs.update(dict(
                 (k, rpn_ret[k]) for k in rpn_ret.keys()
                 if (k.startswith('rpn_cls_logits') or k.startswith('rpn_bbox_pred'))
             ))
             loss_rpn_cls, loss_rpn_bbox = rpn_heads.generic_rpn_losses(**rpn_kwargs)
-            return_dict['loss_rpn_cls'] = loss_rpn_cls
-            return_dict['loss_rpn_bbox'] = loss_rpn_bbox
+            if cfg.FPN.FPN_ON:
+                for i, lvl in enumerate(range(cfg.FPN.RPN_MIN_LEVEL, cfg.FPN.RPN_MAX_LEVEL + 1)):
+                    return_dict['losses']['loss_rpn_cls_fpn%d' % lvl] = loss_rpn_cls[i]
+                    return_dict['losses']['loss_rpn_bbox_fpn%d' % lvl] = loss_rpn_bbox[i]
+            else:
+                return_dict['losses']['loss_rpn_cls'] = loss_rpn_cls
+                return_dict['losses']['loss_rpn_bbox'] = loss_rpn_bbox
 
             # bbox loss
-            loss_cls, loss_bbox = fast_rcnn_heads.fast_rcnn_losses(
+            loss_cls, loss_bbox, accuracy_cls = fast_rcnn_heads.fast_rcnn_losses(
                 cls_score, bbox_pred, rpn_ret['labels_int32'], rpn_ret['bbox_targets'],
                 rpn_ret['bbox_inside_weights'], rpn_ret['bbox_outside_weights'])
-            return_dict['loss_rcnn_cls'] = loss_cls
-            return_dict['loss_rcnn_bbox'] = loss_bbox
+            return_dict['losses']['loss_cls'] = loss_cls
+            return_dict['losses']['loss_bbox'] = loss_bbox
+            return_dict['metrics']['accuracy_cls'] = accuracy_cls
 
             if cfg.MODEL.MASK_ON:
                 if getattr(self.Mask_Head, 'SHARE_RES5', False):
@@ -175,7 +213,7 @@ class Generalized_RCNN(nn.Module):
                 # return_dict['mask_pred'] = mask_pred
                 # mask loss
                 loss_mask = mask_rcnn_heads.mask_rcnn_losses(mask_pred, rpn_ret['masks_int32'])
-                return_dict['loss_rcnn_mask'] = loss_mask
+                return_dict['losses']['loss_mask'] = loss_mask
 
             if cfg.MODEL.KEYPOINTS_ON:
                 if getattr(self.Keypoint_Head, 'SHARE_RES5', False):
@@ -195,7 +233,19 @@ class Generalized_RCNN(nn.Module):
                     loss_keypoints = keypoint_rcnn_heads.keypoint_losses(
                         kps_pred, rpn_ret['keypoint_locations_int32'], rpn_ret['keypoint_weights'],
                         rpn_ret['keypoint_loss_normalizer'])
-                return_dict['loss_rcnn_keypoints'] = loss_keypoints
+                return_dict['losses']['loss_kps'] = loss_keypoints
+
+            # pytorch0.4 bug on gathering scalar(0-dim) tensors
+            for k, v in return_dict['losses'].items():
+                return_dict['losses'][k] = v.unsqueeze(0)
+            for k, v in return_dict['metrics'].items():
+                return_dict['metrics'][k] = v.unsqueeze(0)
+
+        else:
+            # Testing
+            return_dict['rois'] = rpn_ret['rois']
+            return_dict['cls_score'] = cls_score
+            return_dict['bbox_pred'] = bbox_pred
 
         return return_dict
 
@@ -273,26 +323,29 @@ class Generalized_RCNN(nn.Module):
 
         return xform_out
 
+    @check_inference
+    def convbody_net(self, data):
+        """For inference. Run Conv Body only"""
+        blob_conv = self.Conv_Body(data)
+        if cfg.FPN.FPN_ON:
+            # Retain only the blobs that will be used for RoI heads. `blob_conv` may include
+            # extra blobs that are used for RPN proposals, but not for RoI heads.
+            blob_conv = blob_conv[-self.num_roi_levels:]
+        return blob_conv
+
+    @check_inference
     def mask_net(self, blob_conv, rpn_blob):
         """For inference"""
-        if not self.training:
-            mask_feat = self.Mask_Head(blob_conv, rpn_blob)
-            mask_pred = self.Mask_Outs(mask_feat)
-            return mask_pred
-        else:
-            raise ValueError('You should call this function only on inference.'
-                             'Set the network in inference mode by net.eval().')
+        mask_feat = self.Mask_Head(blob_conv, rpn_blob)
+        mask_pred = self.Mask_Outs(mask_feat)
+        return mask_pred
 
-
+    @check_inference
     def keypoint_net(self, blob_conv, rpn_blob):
         """For inference"""
-        if not self.training:
-            kps_feat = self.Keypoint_Head(blob_conv, rpn_blob)
-            kps_pred = self.Keypoint_Outs(kps_feat)
-            return kps_pred
-        else:
-            raise ValueError('You should call this function only on inference.'
-                             'Set the network in inference mode by net.eval().')
+        kps_feat = self.Keypoint_Head(blob_conv, rpn_blob)
+        kps_pred = self.Keypoint_Outs(kps_feat)
+        return kps_pred
 
     @property
     def detectron_weight_mapping(self):
@@ -308,5 +361,9 @@ class Generalized_RCNN(nn.Module):
                         d_wmap[new_key] = value
             self.mapping_to_detectron = d_wmap
             self.orphans_in_detectron = d_orphan
-        
+
         return self.mapping_to_detectron, self.orphans_in_detectron
+
+    def _add_loss(self, return_dict, key, value):
+        """Add loss tensor to returned dictionary"""
+        return_dict['losses'][key] = value
